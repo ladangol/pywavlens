@@ -1,7 +1,8 @@
 
-# Ladan Golshanara, September 2022
+# Ladan Golshanara, September 2025
 
 import os
+import struct
 import sys
 
 ## Filename is the first argument
@@ -17,6 +18,7 @@ try:
 
     num_channels = 0
     bits_per_sample = 0
+    audio_format = 0
 
     ## Get the original filename
     orig_file_size = os.path.getsize(filename)
@@ -37,9 +39,15 @@ try:
     ## Now we may have an arbitrary number of chunks, need to loop to find the two we care about: fmt and data
     while(True):
 
-        ## Read chunk header 
-        chunk_id = f.read(4).decode("ascii")
-        chunk_size = int.from_bytes(f.read(4),"little")
+        ## Read chunk header
+        chunk_id_bytes = f.read(4)
+        if len(chunk_id_bytes) < 4:
+            break
+        chunk_size_bytes = f.read(4)
+        if len(chunk_size_bytes) < 4:
+            break
+        chunk_id = chunk_id_bytes.decode("ascii")
+        chunk_size = int.from_bytes(chunk_size_bytes,"little")
         print("Chunk tag: ",chunk_id)
         print("Chunk size: ",chunk_size)
 
@@ -56,6 +64,7 @@ try:
 
             ## Read the fmt code (PCM = 1)
             fmt_code = int.from_bytes(f.read(2),"little")
+            audio_format = fmt_code
             print(" - fmt code: ",fmt_code)
             bytes_read += 2
 
@@ -82,6 +91,19 @@ try:
             print(" - bits_per_sample: ", bits_per_sample)
             bytes_read += 2
 
+            if fmt_code == 0xFFFE and chunk_size - bytes_read >= 24:
+                extension_size = int.from_bytes(f.read(2),"little")
+                valid_bits_per_sample = int.from_bytes(f.read(2),"little")
+                channel_mask = int.from_bytes(f.read(4),"little")
+                subformat = f.read(16)
+                subformat_code = int.from_bytes(subformat[0:4],"little")
+                audio_format = subformat_code
+                bytes_read += 24
+                print(" - extension size: ", extension_size)
+                print(" - valid bits_per_sample: ", valid_bits_per_sample)
+                print(" - channel mask: ", channel_mask)
+                print(" - subformat code: ", subformat_code)
+
             ## We read what we wanted from the fmt tag, 
             ## skip the rest 
 
@@ -91,32 +113,74 @@ try:
             continue
 
         elif (chunk_id.startswith("data")):
-            bytes_read = 0
             if fmt_found == False:
                 print("error: no fmt chunk, don't know how to interpret the data")
                 break
+            data_start = f.tell()
+            if audio_format not in (0x0001, 0x0003):
+                print("error: unsupported fmt code: ", fmt_code)
+                f.seek(data_start + chunk_size)
+                continue
+            if bits_per_sample % 8 != 0:
+                print("error: unsupported bits_per_sample: ", bits_per_sample)
+                f.seek(data_start + chunk_size)
+                continue
+            if audio_format == 0x0001 and bits_per_sample not in (8, 16, 24, 32):
+                print("error: unsupported PCM bits_per_sample: ", bits_per_sample)
+                f.seek(data_start + chunk_size)
+                continue
+            if audio_format == 0x0003 and bits_per_sample != 32:
+                print("error: unsupported IEEE float bits_per_sample: ", bits_per_sample)
+                f.seek(data_start + chunk_size)
+                continue
             bytes_to_read = int(bits_per_sample/8)
+            bytes_per_frame = bytes_to_read * num_channels
+            num_sample_frames = chunk_size // bytes_per_frame
+            samples_to_show_at_start = 5
+            samples_to_show_at_end = 2
 
-	    # Note that the number of samples here is hard coded..
-            for i in range(10000):
-                print("num_channels: ",num_channels)
+            print(" - sample frames: ", num_sample_frames)
+
+            def print_sample_frame(sample_index):
+                print("sample ", sample_index)
                 for chan in range(num_channels):
                     float_sample = 0.0
                     ## Read the appropriate number of bytes for a sample, convert to float
-                    int_sample = int.from_bytes(f.read(bytes_to_read),"little",signed=True)
-                    if bits_per_sample == 16:
-                        ## Normalize to [-1,1) for 16-bits
-                        float_sample = int_sample / 32768.0
-                    elif bits_per_sample == 24:
-                        ## Normalize to [-1,1) for 24-bits
-                        float_sample = int_sample / 0x800000
-                    elif bits_per_sample == 32:
-                        ## Normalize to [-1,1) for 32-bits
-                        float_sample = int_sample / 0x7fffffff
+                    sample_bytes = f.read(bytes_to_read)
+                    if audio_format == 0x0003 and bits_per_sample == 32:  #for IEEE wav
+                        float_sample = struct.unpack("<f", sample_bytes)[0]
+                    elif bits_per_sample == 8:
+                        ## 8-bit PCM WAV samples are unsigned, centered around 128
+                        int_sample = int.from_bytes(sample_bytes,"little",signed=False)
+                        float_sample = (int_sample - 128) / 128.0
+                    else:
+                        int_sample = int.from_bytes(sample_bytes,"little",signed=True)
+                        if bits_per_sample == 16:
+                            ## Normalize to [-1,1) for 16-bits
+                            float_sample = int_sample / 32768.0
+                        elif bits_per_sample == 24:
+                            ## Normalize to [-1,1) for 24-bits
+                            float_sample = int_sample / 0x800000
+                        elif bits_per_sample == 32:
+                            ## Normalize to [-1,1) for 32-bits
+                            float_sample = int_sample / 0x7fffffff
                     print("chan ",chan, ": ",float_sample)
-                    bytes_read += bytes_to_read
 
-            f.seek(chunk_size-bytes_read,1)
+            samples_at_start = min(samples_to_show_at_start, num_sample_frames)
+            for i in range(samples_at_start):
+                print_sample_frame(i)
+
+            if num_sample_frames > samples_to_show_at_start + samples_to_show_at_end:
+                print("...")
+                bytes_to_skip = (num_sample_frames - samples_to_show_at_start - samples_to_show_at_end) * bytes_per_frame
+                f.seek(bytes_to_skip, 1)
+                for i in range(num_sample_frames - samples_to_show_at_end, num_sample_frames):
+                    print_sample_frame(i)
+            else:
+                for i in range(samples_at_start, num_sample_frames):
+                    print_sample_frame(i)
+
+            f.seek(data_start + chunk_size)
             continue
                 
         ## If EOF, break out of the loop
