@@ -1,4 +1,4 @@
-# Example code by Waveshaper AI
+
 # Ladan Golshanara, September 2022
 
 import os
