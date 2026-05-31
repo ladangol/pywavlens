@@ -1,196 +1,324 @@
-
 # Ladan Golshanara, September 2025
 
+import argparse
 import os
 import struct
-import sys
 
-## Filename is the first argument
-filename = sys.argv[1]
 
-## Create a file handle 
-f = open(filename,"rb")
+WAVE_FORMAT_PCM = 0x0001
+WAVE_FORMAT_IEEE_FLOAT = 0x0003
+WAVE_FORMAT_EXTENSIBLE = 0xFFFE
 
-try:
 
-    ## Located fmt chunk
-    fmt_found = False
+def format_name(format_code):
+    names = {
+        WAVE_FORMAT_PCM: "PCM",
+        WAVE_FORMAT_IEEE_FLOAT: "IEEE Float",
+        WAVE_FORMAT_EXTENSIBLE: "Extensible",
+        0x0011: "IMA ADPCM",
+        0x0055: "MPEG Layer 3",
+    }
+    return names.get(format_code, "Unknown")
 
-    num_channels = 0
-    bits_per_sample = 0
-    audio_format = 0
 
-    ## Get the original filename
-    orig_file_size = os.path.getsize(filename)
-    print("Total file size on filesystem: ",orig_file_size)
+def channel_description(num_channels):
+    if num_channels == 1:
+        return "Mono"
+    if num_channels == 2:
+        return "Stereo"
+    return str(num_channels) + " channels"
 
-    ## Read the first 4 bytes of the file
-    riff_id = f.read(4)
-    print("First 4 bytes should be the RIFF tag: ",riff_id)
 
-    ## Read the next 4 bytes of the file 
-    size_bytes = f.read(4)
-    print("Next 4 bytes is size of total sub chunks (total file size minus 8 header bytes): ", int.from_bytes(size_bytes, "little"))
+def sample_type(audio_format, bits_per_sample):
+    if audio_format == WAVE_FORMAT_IEEE_FLOAT:
+        return "float32"
+    return "int" + str(bits_per_sample)
 
-    ## Read the next 4 bytes of the file
-    wav_id = f.read(4)
-    print("Next 4 bytes should be the WAVE tag: ",wav_id)
-    
-    ## Now we may have an arbitrary number of chunks, need to loop to find the two we care about: fmt and data
-    while(True):
 
-        ## Read chunk header
-        chunk_id_bytes = f.read(4)
-        if len(chunk_id_bytes) < 4:
-            break
-        chunk_size_bytes = f.read(4)
-        if len(chunk_size_bytes) < 4:
-            break
-        chunk_id = chunk_id_bytes.decode("ascii")
-        chunk_size = int.from_bytes(chunk_size_bytes,"little")
-        print("Chunk tag: ",chunk_id)
-        print("Chunk size: ",chunk_size)
+def channel_label(channel, num_channels):
+    if num_channels == 1:
+        return "Mono"
+    if num_channels == 2:
+        return ["Left", "Right"][channel]
+    return "Channel " + str(channel)
 
-        ## Do fmt chunk
-        if chunk_id.startswith("fmt"):
-            ## Set the flag to true, we have encountered the fmt chunk
-            fmt_found = True
 
-            ## Because we might stop reading the chunk before it is done,
-            ## track the number of bytes of the chunk we have read
-            ## so we can skip the rest, if there is more than the fields we
-            ## extract
-            bytes_read = 0
+def layout_label(channel, frame_index, num_channels):
+    if num_channels == 1:
+        return "M" + str(frame_index)
+    if num_channels == 2:
+        return ["L", "R"][channel] + str(frame_index)
+    return "C" + str(channel) + "_" + str(frame_index)
 
-            ## Read the fmt code (PCM = 1)
-            fmt_code = int.from_bytes(f.read(2),"little")
-            audio_format = fmt_code
-            print(" - fmt code: ",fmt_code)
-            bytes_read += 2
 
-            ## Read the number of channels
-            num_channels = int.from_bytes(f.read(2),"little")
-            print(" - channels: ",num_channels)
-            bytes_read += 2
+def is_supported(audio_format, bits_per_sample):
+    if audio_format == WAVE_FORMAT_PCM and bits_per_sample in (8, 16, 24, 32):
+        return True
+    if audio_format == WAVE_FORMAT_IEEE_FLOAT and bits_per_sample == 32:
+        return True
+    return False
 
-            ## Read the sample rate
-            sample_rate = int.from_bytes(f.read(4),"little")
-            print(" - samples per second: ",sample_rate)
-            bytes_read += 4
 
-            ## Read the byte rate
-            byte_rate = int.from_bytes(f.read(4),"little")
-            print(" - byte rate: ", byte_rate)
-            bytes_read += 4
+def unsupported_reason(fmt_code, audio_format, bits_per_sample):
+    if audio_format not in (WAVE_FORMAT_PCM, WAVE_FORMAT_IEEE_FLOAT):
+        return format_name(fmt_code) + " is not yet supported."
+    if audio_format == WAVE_FORMAT_IEEE_FLOAT:
+        return "Only 32-bit IEEE float is supported."
+    return "PCM " + str(bits_per_sample) + "-bit samples are not yet supported."
 
-            block_align = int.from_bytes(f.read(2),"little")
-            print(" - block align: ", block_align)
-            bytes_read += 2
-            
-            bits_per_sample = int.from_bytes(f.read(2),"little")
-            print(" - bits_per_sample: ", bits_per_sample)
-            bytes_read += 2
 
-            if fmt_code == 0xFFFE and chunk_size - bytes_read >= 24:
-                extension_size = int.from_bytes(f.read(2),"little")
-                valid_bits_per_sample = int.from_bytes(f.read(2),"little")
-                channel_mask = int.from_bytes(f.read(4),"little")
-                subformat = f.read(16)
-                subformat_code = int.from_bytes(subformat[0:4],"little")
-                audio_format = subformat_code
-                bytes_read += 24
-                print(" - extension size: ", extension_size)
-                print(" - valid bits_per_sample: ", valid_bits_per_sample)
-                print(" - channel mask: ", channel_mask)
-                print(" - subformat code: ", subformat_code)
+def decode_sample(sample_bytes, audio_format, bits_per_sample):
+    if audio_format == WAVE_FORMAT_IEEE_FLOAT:
+        return struct.unpack("<f", sample_bytes)[0]
 
-            ## We read what we wanted from the fmt tag, 
-            ## skip the rest 
+    if bits_per_sample == 8:
+        int_sample = int.from_bytes(sample_bytes, "little", signed=False)
+        return (int_sample - 128) / 128.0
 
-            f.seek(chunk_size-bytes_read,1)
-            print("bytes remaining in fmt chunk: ",chunk_size-bytes_read)
+    int_sample = int.from_bytes(sample_bytes, "little", signed=True)
+    if bits_per_sample == 16:
+        return int_sample / 32768.0
+    if bits_per_sample == 24:
+        return int_sample / 0x800000
+    if bits_per_sample == 32:
+        return int_sample / 0x7fffffff
 
-            continue
+    raise ValueError("unsupported PCM bits_per_sample: " + str(bits_per_sample))
 
-        elif (chunk_id.startswith("data")):
-            if fmt_found == False:
-                print("error: no fmt chunk, don't know how to interpret the data")
+
+def read_wav(filename):
+    metadata = {
+        "filename": filename,
+        "filesystem_size": os.path.getsize(filename),
+        "chunks": [],
+        "fmt": None,
+        "data": None,
+        "riff_size": None,
+        "wave_id": None,
+        "is_riff": False,
+    }
+
+    with open(filename, "rb") as f:
+        riff_id = f.read(4)
+        metadata["is_riff"] = riff_id == b"RIFF"
+        metadata["riff_size"] = int.from_bytes(f.read(4), "little")
+        metadata["wave_id"] = f.read(4).decode("ascii", errors="replace")
+
+        while True:
+            chunk_id_bytes = f.read(4)
+            if len(chunk_id_bytes) < 4:
                 break
-            data_start = f.tell()
-            if audio_format not in (0x0001, 0x0003):
-                print("error: unsupported fmt code: ", fmt_code)
-                f.seek(data_start + chunk_size)
-                continue
-            if bits_per_sample % 8 != 0:
-                print("error: unsupported bits_per_sample: ", bits_per_sample)
-                f.seek(data_start + chunk_size)
-                continue
-            if audio_format == 0x0001 and bits_per_sample not in (8, 16, 24, 32):
-                print("error: unsupported PCM bits_per_sample: ", bits_per_sample)
-                f.seek(data_start + chunk_size)
-                continue
-            if audio_format == 0x0003 and bits_per_sample != 32:
-                print("error: unsupported IEEE float bits_per_sample: ", bits_per_sample)
-                f.seek(data_start + chunk_size)
-                continue
-            bytes_to_read = int(bits_per_sample/8)
-            bytes_per_frame = bytes_to_read * num_channels
-            num_sample_frames = chunk_size // bytes_per_frame
-            samples_to_show_at_start = 5
-            samples_to_show_at_end = 2
+            chunk_size_bytes = f.read(4)
+            if len(chunk_size_bytes) < 4:
+                break
 
-            print(" - sample frames: ", num_sample_frames)
+            chunk_id = chunk_id_bytes.decode("ascii", errors="replace")
+            chunk_size = int.from_bytes(chunk_size_bytes, "little")
+            chunk_start = f.tell()
+            metadata["chunks"].append({"id": chunk_id, "size": chunk_size, "start": chunk_start})
 
-            def print_sample_frame(sample_index):
-                print("sample ", sample_index)
-                for chan in range(num_channels):
-                    float_sample = 0.0
-                    ## Read the appropriate number of bytes for a sample, convert to float
-                    sample_bytes = f.read(bytes_to_read)
-                    if audio_format == 0x0003 and bits_per_sample == 32:  #for IEEE wav
-                        float_sample = struct.unpack("<f", sample_bytes)[0]
-                    elif bits_per_sample == 8:
-                        ## 8-bit PCM WAV samples are unsigned, centered around 128
-                        int_sample = int.from_bytes(sample_bytes,"little",signed=False)
-                        float_sample = (int_sample - 128) / 128.0
-                    else:
-                        int_sample = int.from_bytes(sample_bytes,"little",signed=True)
-                        if bits_per_sample == 16:
-                            ## Normalize to [-1,1) for 16-bits
-                            float_sample = int_sample / 32768.0
-                        elif bits_per_sample == 24:
-                            ## Normalize to [-1,1) for 24-bits
-                            float_sample = int_sample / 0x800000
-                        elif bits_per_sample == 32:
-                            ## Normalize to [-1,1) for 32-bits
-                            float_sample = int_sample / 0x7fffffff
-                    print("chan ",chan, ": ",float_sample)
-
-            samples_at_start = min(samples_to_show_at_start, num_sample_frames)
-            for i in range(samples_at_start):
-                print_sample_frame(i)
-
-            if num_sample_frames > samples_to_show_at_start + samples_to_show_at_end:
-                print("...")
-                bytes_to_skip = (num_sample_frames - samples_to_show_at_start - samples_to_show_at_end) * bytes_per_frame
-                f.seek(bytes_to_skip, 1)
-                for i in range(num_sample_frames - samples_to_show_at_end, num_sample_frames):
-                    print_sample_frame(i)
+            if chunk_id == "fmt ":
+                fmt = read_fmt_chunk(f, chunk_size)
+                metadata["fmt"] = fmt
+            elif chunk_id == "data":
+                metadata["data"] = {"size": chunk_size, "start": chunk_start}
+                f.seek(chunk_size, 1)
             else:
-                for i in range(samples_at_start, num_sample_frames):
-                    print_sample_frame(i)
+                f.seek(chunk_size, 1)
 
-            f.seek(data_start + chunk_size)
-            continue
-                
-        ## If EOF, break out of the loop
-        if (f.tell() == os.fstat(f.fileno()).st_size):
-            break
+            if chunk_size % 2 == 1:
+                f.seek(1, 1)
 
-        ## Otherwise, skip chunk
-        f.seek(chunk_size,1)
-        
-    
-finally:
-    ## Close the file
-    f.close()
+    return metadata
+
+
+def read_fmt_chunk(f, chunk_size):
+    bytes_read = 0
+    fmt_code = int.from_bytes(f.read(2), "little")
+    num_channels = int.from_bytes(f.read(2), "little")
+    sample_rate = int.from_bytes(f.read(4), "little")
+    byte_rate = int.from_bytes(f.read(4), "little")
+    block_align = int.from_bytes(f.read(2), "little")
+    bits_per_sample = int.from_bytes(f.read(2), "little")
+    bytes_read += 16
+
+    fmt = {
+        "chunk_size": chunk_size,
+        "fmt_code": fmt_code,
+        "audio_format": fmt_code,
+        "num_channels": num_channels,
+        "sample_rate": sample_rate,
+        "byte_rate": byte_rate,
+        "block_align": block_align,
+        "bits_per_sample": bits_per_sample,
+        "extension_size": None,
+        "valid_bits_per_sample": None,
+        "channel_mask": None,
+        "subformat_code": None,
+    }
+
+    if fmt_code == WAVE_FORMAT_EXTENSIBLE and chunk_size - bytes_read >= 24:
+        fmt["extension_size"] = int.from_bytes(f.read(2), "little")
+        fmt["valid_bits_per_sample"] = int.from_bytes(f.read(2), "little")
+        fmt["channel_mask"] = int.from_bytes(f.read(4), "little")
+        subformat = f.read(16)
+        fmt["subformat_code"] = int.from_bytes(subformat[0:4], "little")
+        fmt["audio_format"] = fmt["subformat_code"]
+        bytes_read += 24
+
+    f.seek(chunk_size - bytes_read, 1)
+    return fmt
+
+
+def sample_frames_to_show(frame_count):
+    samples_to_show_at_start = 5
+    samples_to_show_at_end = 2
+
+    if frame_count <= samples_to_show_at_start + samples_to_show_at_end:
+        return list(range(frame_count))
+
+    return (
+        list(range(samples_to_show_at_start))
+        + [None]
+        + list(range(frame_count - samples_to_show_at_end, frame_count))
+    )
+
+
+def read_sample_preview(filename, fmt, data):
+    if not is_supported(fmt["audio_format"], fmt["bits_per_sample"]):
+        return []
+
+    bytes_per_sample = fmt["bits_per_sample"] // 8
+    frame_count = data["size"] // fmt["block_align"]
+    preview = []
+
+    with open(filename, "rb") as f:
+        for frame_index in sample_frames_to_show(frame_count):
+            if frame_index is None:
+                preview.append(None)
+                continue
+
+            f.seek(data["start"] + frame_index * fmt["block_align"])
+            channels = []
+            for _ in range(fmt["num_channels"]):
+                sample_bytes = f.read(bytes_per_sample)
+                channels.append(decode_sample(sample_bytes, fmt["audio_format"], fmt["bits_per_sample"]))
+            preview.append({"frame": frame_index, "channels": channels})
+
+    return preview
+
+
+def print_tree(metadata):
+    fmt = metadata["fmt"]
+    data = metadata["data"]
+
+    if metadata["is_riff"] and metadata["wave_id"] == "WAVE":
+        print("✓ RIFF/WAVE file detected")
+    else:
+        print("✗ Not a RIFF/WAVE file")
+    print()
+
+    print("RIFF")
+    print("├─ File size: " + str(metadata["filesystem_size"]) + " bytes")
+    print("├─ RIFF payload size: " + str(metadata["riff_size"]) + " bytes")
+    print("├─ Format: " + str(metadata["wave_id"]))
+    print("│")
+
+    if fmt is None:
+        print("└─ Status")
+        print("   └─ ✗ Missing fmt chunk")
+        return
+
+    print("├─ fmt")
+    print("│  ├─ Chunk size: " + str(fmt["chunk_size"]) + " bytes")
+    print("│  ├─ Format: " + format_name(fmt["fmt_code"]) + " (" + str(fmt["fmt_code"]) + ")")
+    if fmt["fmt_code"] == WAVE_FORMAT_EXTENSIBLE:
+        print(
+            "│  ├─ Subformat: "
+            + format_name(fmt["audio_format"])
+            + " ("
+            + str(fmt["audio_format"])
+            + ")"
+        )
+    print(
+        "│  ├─ Channels: "
+        + str(fmt["num_channels"])
+        + " ("
+        + channel_description(fmt["num_channels"])
+        + ")"
+    )
+    print("│  ├─ Sample rate: " + str(fmt["sample_rate"]) + " Hz")
+    print("│  ├─ Byte rate: " + str(fmt["byte_rate"]) + " bytes/sec")
+    print("│  ├─ Block align: " + str(fmt["block_align"]) + " bytes/frame")
+    print("│  └─ Bits per sample: " + str(fmt["bits_per_sample"]))
+    print("│")
+
+    if data is None:
+        print("└─ Status")
+        print("   └─ ✗ Missing data chunk")
+        return
+
+    frame_count = data["size"] // fmt["block_align"]
+    print("├─ data")
+    print("│  ├─ Chunk size: " + str(data["size"]) + " bytes")
+    print("│  ├─ Frames: " + str(frame_count))
+    print("│  └─ Layout:")
+    print("│")
+    for frame_index in range(min(3, frame_count)):
+        cells = "".join("[" + layout_label(channel, frame_index, fmt["num_channels"]) + "]" for channel in range(fmt["num_channels"]))
+        print("│      Frame " + str(frame_index) + ": " + cells)
+    if frame_count > 3:
+        print("│      ...")
+    print("│")
+
+    print_audio_frame_box(fmt)
+    print("│")
+
+    if is_supported(fmt["audio_format"], fmt["bits_per_sample"]):
+        print("│  Sample values:")
+        for sample in read_sample_preview(metadata["filename"], fmt, data):
+            if sample is None:
+                print("      ...")
+                continue
+            print("      sample ", sample["frame"])
+            for channel, value in enumerate(sample["channels"]):
+                print("      chan ", channel, ": ", value)
+        print("│")
+        print("└─ Status")
+        print("   └─ ✓ Supported by this reader")
+    else:
+        print("└─ Status")
+        print("   └─ ✗ " + unsupported_reason(fmt["fmt_code"], fmt["audio_format"], fmt["bits_per_sample"]))
+        print("      error: unsupported fmt code: ", fmt["fmt_code"])
+
+
+def print_audio_frame_box(fmt):
+    num_channels = fmt["num_channels"]
+    kind = sample_type(fmt["audio_format"], fmt["bits_per_sample"])
+    cell_width = max(8, len(kind) + 4)
+    top = "│  ┌" + "┬".join("─" * cell_width for _ in range(num_channels)) + "┐"
+    middle = "│  │" + "│".join(channel_label(i, num_channels).ljust(cell_width) for i in range(num_channels)) + "│"
+    type_line = "│  │" + "│".join(kind.ljust(cell_width) for _ in range(num_channels)) + "│"
+    bottom = "│  └" + "┴".join("─" * cell_width for _ in range(num_channels)) + "┘"
+
+    print("│  Audio frame")
+    print("│")
+    print(top)
+    print(middle)
+    print(type_line)
+    print(bottom)
+    print("│")
+    print("│  Frame size = " + str(fmt["block_align"]) + " bytes")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Read and visualize a WAV file.")
+    parser.add_argument("filename")
+    args = parser.parse_args()
+
+    metadata = read_wav(args.filename)
+    print_tree(metadata)
+
+
+if __name__ == "__main__":
+    main()
